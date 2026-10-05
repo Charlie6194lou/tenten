@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#ffcc00">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
+<title>Ten Ten maison</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #fff; text-align: center;
+         min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 16px; box-sizing: border-box; }
+  input, button { font: inherit; padding: 12px 16px; border-radius: 12px; border: 0; width: 260px; max-width: 100%; }
+  .go { background: #ffcc00; color: #111; font-weight: bold; }
+  #talk { width: 200px; height: 200px; border-radius: 50%; background: #ffcc00; color: #111; font-size: 22px; font-weight: bold;
+          user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: none; }
+  #talk.on { background: #ff3b30; color: #fff; transform: scale(1.05); }
+  #friends span { display: inline-block; background: #222; padding: 6px 12px; border-radius: 20px; margin: 4px; }
+  #friends span.speaking { background: #34c759; color: #111; }
+  #status { color: #aaa; min-height: 1.2em; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>📻 Ten Ten maison</h1>
+
+<form id="join">
+  <p><input id="name" placeholder="Ton pseudo" required maxlength="30"></p>
+  <p><input id="group" placeholder="Code du groupe (secret)" required maxlength="30"></p>
+  <p><button class="go">Rejoindre</button></p>
+</form>
+
+<div id="room" hidden>
+  <div id="friends"></div>
+  <button id="talk">Maintiens<br>pour parler</button>
+  <p><button id="leave">Changer de groupe</button></p>
+</div>
+<p id="status"></p>
+
+<script>
+const $ = id => document.getElementById(id);
+const player = new Audio();
+const queue = [];
+let stream, recorder, chunks = [], me, group, es;
+
+function store(k, v) { try { v === undefined ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} }
+function load(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } }
+$('name').value = load('name'); $('group').value = load('group');
+
+const qs = () => `group=${encodeURIComponent(group)}&name=${encodeURIComponent(me)}`;
+
+$('join').onsubmit = async e => {
+  e.preventDefault();
+  me = $('name').value.trim(); group = $('group').value.trim().toLowerCase();
+  // Ce clic débloque la lecture auto du son (les navigateurs l'exigent) et demande le micro.
+  player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+  player.play().catch(() => {});
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch { $('status').textContent = 'Il faut autoriser le micro.'; return; }
+  store('name', me); store('group', group);
+  $('join').hidden = true; $('room').hidden = false;
+  listen();
+};
+
+$('leave').onclick = () => { es && es.close(); store('group'); location.reload(); };
+
+function listen() {
+  es = new EventSource('/listen?' + qs()); // se reconnecte tout seul si le réseau coupe
+  es.onopen = () => $('status').textContent = 'Connecté au groupe « ' + group + ' »';
+  es.onerror = () => $('status').textContent = 'Reconnexion…';
+  es.addEventListener('members', e => {
+    $('friends').innerHTML = '';
+    for (const n of JSON.parse(e.data)) {
+      const s = document.createElement('span');
+      s.textContent = n === me ? n + ' (toi)' : n;
+      s.dataset.name = n;
+      $('friends').append(s);
+    }
+  });
+  es.addEventListener('voice', e => { queue.push(JSON.parse(e.data)); if (player.paused) playNext(); });
+}
+
+function playNext() {
+  document.querySelectorAll('#friends .speaking').forEach(s => s.classList.remove('speaking'));
+  const clip = queue.shift();
+  if (!clip) return;
+  const tag = [...document.querySelectorAll('#friends span')].find(s => s.dataset.name === clip.from);
+  tag && tag.classList.add('speaking');
+  $('status').textContent = '🔊 ' + clip.from;
+  if (navigator.vibrate) navigator.vibrate(80);
+  player.src = clip.audio;
+  player.play().catch(() => { $('status').textContent = 'Touche l\'écran pour entendre ' + clip.from; });
+}
+player.onended = playNext;
+
+function start(e) {
+  e.preventDefault();
+  if (recorder && recorder.state === 'recording') return;
+  chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = d => chunks.push(d.data);
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    if (blob.size < 1000) return; // appui trop court
+    fetch('/talk?' + qs(), { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob })
+      .then(r => $('status').textContent = r.ok ? 'Envoyé ✓' : 'Message trop long')
+      .catch(() => $('status').textContent = 'Pas envoyé (réseau)');
+  };
+  recorder.start();
+  $('talk').classList.add('on');
+  if (navigator.vibrate) navigator.vibrate(30);
+}
+function stop() {
+  if (recorder && recorder.state === 'recording') recorder.stop();
+  $('talk').classList.remove('on');
+}
+$('talk').addEventListener('pointerdown', start);
+['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => $('talk').addEventListener(ev, stop));
+</script>
+</body>
+</html>
