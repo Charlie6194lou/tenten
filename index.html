@@ -34,6 +34,7 @@
 <div id="room" hidden>
   <div id="friends"></div>
   <button id="talk">Maintiens<br>pour parler</button>
+  <p style="color:#aaa;font-size:14px">Garde l'appli ouverte, écran allumé, pour entendre tes potes.</p>
   <p><button id="leave">Changer de groupe</button></p>
 </div>
 <p id="status"></p>
@@ -46,8 +47,10 @@ const $ = id => document.getElementById(id);
 const player = new Audio();
 const queue = [];
 const myId = Math.random().toString(36).slice(2);
-const seen = {}; // pseudo -> dernière fois vu
-let stream, recorder, chunks = [], me, group, topic, es;
+const seen = {};        // pseudo -> dernière fois vu
+const got = new Set();  // ids des messages déjà traités (le rattrapage en renvoie certains)
+let stream, recorder, chunks = [], me, group, topic, es, lastTs = 0, retry;
+let playing = null, waiting = null, watchdog;
 
 function store(k, v) { try { v === undefined ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} }
 function load(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } }
@@ -61,45 +64,69 @@ async function topicFor(code) {
 const post = (meta, body, params = '') =>
   fetch(`${RELAY}/${topic}?message=${encodeURIComponent(JSON.stringify(meta))}${params}`, { method: 'POST', body });
 
+// 0,1 s de vrai silence : sert à débloquer la lecture auto sur iPhone.
+function silence() {
+  const n = 800, v = new DataView(new ArrayBuffer(44 + n));
+  const str = (o, t) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); // PCM, mono
+  v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  str(36, 'data'); v.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) v.setUint8(44 + i, 128); // 128 = silence en 8 bits
+  return URL.createObjectURL(new Blob([v], { type: 'audio/wav' }));
+}
+
 $('join').onsubmit = async e => {
   e.preventDefault();
   me = $('name').value.trim().slice(0, 30); group = $('group').value.trim().toLowerCase();
-  // Ce clic débloque la lecture auto du son (les navigateurs l'exigent) et demande le micro.
-  player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+  // Ce clic débloque la lecture auto du son (les navigateurs l'exigent) : on lance puis on coupe tout de suite.
+  player.src = silence();
   player.play().catch(() => {});
+  player.pause();
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch { $('status').textContent = 'Il faut autoriser le micro.'; return; }
   store('name', me); store('group', group);
   topic = await topicFor(group);
   $('join').hidden = true; $('room').hidden = false;
-  listen();
+  keepAwake();
+  connect();
+  setInterval(hello, 60000);    // "je suis là", toutes les minutes
+  setInterval(renderFriends, 15000);
+  renderFriends();
 };
 
 $('leave').onclick = () => { es && es.close(); store('group'); location.reload(); };
 
 const hello = () => post({ t: 'hi', n: me, id: myId }, null, '&cache=no').catch(() => {});
+// Garde l'écran allumé (sinon le téléphone se verrouille et n'entend plus rien).
+const keepAwake = () => navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => {});
 
-function listen() {
-  es = new EventSource(`${RELAY}/${topic}/sse`); // se reconnecte tout seul si le réseau coupe
+function connect() {
+  clearTimeout(retry); es && es.close();
+  // since= : au retour (écran rallumé, réseau revenu), on récupère les messages manqués.
+  es = new EventSource(`${RELAY}/${topic}/sse` + (lastTs ? '?since=' + lastTs : ''));
   es.onopen = () => { $('status').textContent = 'Connecté au groupe « ' + group + ' »'; hello(); };
-  es.onerror = () => $('status').textContent = 'Reconnexion…';
+  es.onerror = () => { $('status').textContent = 'Reconnexion…'; es.close(); retry = setTimeout(connect, 3000); };
+  es.addEventListener('keepalive', e => { try { lastTs = Math.max(lastTs, JSON.parse(e.data).time); } catch {} });
   es.onmessage = e => {
     let m, p;
     try { m = JSON.parse(e.data); p = JSON.parse(m.message); } catch { return; }
-    if (m.event !== 'message' || !p || p.id === myId || typeof p.n !== 'string') return;
+    if (m.time) lastTs = Math.max(lastTs, m.time);
+    if (m.event !== 'message' || got.has(m.id)) return;
+    got.add(m.id);
+    if (!p || p.id === myId || typeof p.n !== 'string') return;
     const isNew = !seen[p.n] || Date.now() - seen[p.n] > 150000;
     seen[p.n] = Date.now();
     renderFriends();
     if (p.t === 'hi' && isNew) hello(); // un nouveau arrive : on lui dit qu'on est là
-    if (p.t === 'voice' && m.attachment && m.attachment.url) {
+    const fresh = !m.time || Date.now() / 1000 - m.time < 300; // on ne rejoue pas les vieux messages
+    if (p.t === 'voice' && fresh && m.attachment && m.attachment.url) {
       queue.push({ from: p.n, audio: m.attachment.url });
-      if (player.paused) playNext();
+      if (!playing && !waiting) playNext();
     }
   };
-  setInterval(hello, 60000);    // "je suis là", toutes les minutes
-  setInterval(renderFriends, 15000);
-  renderFriends();
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && topic) { keepAwake(); connect(); } });
 
 function renderFriends() {
   $('friends').innerHTML = '';
@@ -113,17 +140,33 @@ function renderFriends() {
 }
 
 function playNext() {
+  clearTimeout(watchdog);
   document.querySelectorAll('#friends .speaking').forEach(s => s.classList.remove('speaking'));
-  const clip = queue.shift();
-  if (!clip) return;
+  const clip = playing = queue.shift() || null;
+  if (!clip) { $('status').textContent = 'Connecté au groupe « ' + group + ' »'; return; }
+  const next = () => { if (playing === clip) playNext(); };
+  player.onended = player.onerror = next; // un message illisible ne bloque pas les suivants
   const tag = [...document.querySelectorAll('#friends span')].find(s => s.dataset.name === clip.from);
   tag && tag.classList.add('speaking');
   $('status').textContent = '🔊 ' + clip.from;
   if (navigator.vibrate) navigator.vibrate(80);
   player.src = clip.audio;
-  player.play().catch(() => { $('status').textContent = 'Touche l\'écran pour entendre ' + clip.from; });
+  watchdog = setTimeout(() => { if (player.currentTime === 0) next(); }, 15000); // chargement bloqué
+  player.play().catch(err => {
+    if (playing !== clip) return;
+    if (err.name === 'NotAllowedError') { // le téléphone exige un toucher
+      clearTimeout(watchdog); waiting = clip; playing = null;
+      $('status').textContent = '👆 Touche l\'écran pour entendre ' + clip.from;
+      return;
+    }
+    $('status').textContent = 'Message de ' + clip.from + ' illisible';
+    next();
+  });
 }
-player.onended = playNext;
+// Un toucher n'importe où (sauf le bouton parler) joue le message en attente.
+document.addEventListener('pointerdown', e => {
+  if (waiting && e.target.id !== 'talk') { queue.unshift(waiting); waiting = null; playNext(); }
+});
 
 function start(e) {
   e.preventDefault();
@@ -134,8 +177,9 @@ function start(e) {
   recorder.onstop = () => {
     const type = recorder.mimeType || 'audio/webm';
     const blob = new Blob(chunks); // sans type exprès : voir post()
-    if (blob.size < 1000) return; // appui trop court
+    if (blob.size < 1000) { $('status').textContent = 'Trop court, maintiens le bouton'; return; }
     const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+    $('status').textContent = 'Envoi…';
     post({ t: 'voice', n: me, id: myId }, blob, '&filename=voix.' + ext)
       .then(r => $('status').textContent = r.ok ? 'Envoyé ✓' : 'Pas envoyé (' + r.status + ')')
       .catch(() => $('status').textContent = 'Pas envoyé (réseau)');
