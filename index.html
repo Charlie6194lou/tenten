@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#ffcc00">
-<link rel="manifest" href="/manifest.json">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.svg">
 <title>Ten Ten maison</title>
 <style>
   body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #fff; text-align: center;
@@ -39,46 +39,77 @@
 <p id="status"></p>
 
 <script>
+// Pas de serveur à nous : les messages passent par ntfy.sh, un relais public et gratuit.
+// Le code du groupe sert de mot de passe : il devient un nom de canal impossible à deviner.
+const RELAY = 'https://ntfy.sh';
 const $ = id => document.getElementById(id);
 const player = new Audio();
 const queue = [];
-let stream, recorder, chunks = [], me, group, es;
+const myId = Math.random().toString(36).slice(2);
+const seen = {}; // pseudo -> dernière fois vu
+let stream, recorder, chunks = [], me, group, topic, es;
 
 function store(k, v) { try { v === undefined ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} }
 function load(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } }
 $('name').value = load('name'); $('group').value = load('group');
 
-const qs = () => `group=${encodeURIComponent(group)}&name=${encodeURIComponent(me)}`;
+async function topicFor(code) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('tenten-maison:' + code));
+  return 'tenten_' + [...new Uint8Array(hash)].slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+// POST sans Content-Type : requête "simple", pas de pré-vérification CORS.
+const post = (meta, body, params = '') =>
+  fetch(`${RELAY}/${topic}?message=${encodeURIComponent(JSON.stringify(meta))}${params}`, { method: 'POST', body });
 
 $('join').onsubmit = async e => {
   e.preventDefault();
-  me = $('name').value.trim(); group = $('group').value.trim().toLowerCase();
+  me = $('name').value.trim().slice(0, 30); group = $('group').value.trim().toLowerCase();
   // Ce clic débloque la lecture auto du son (les navigateurs l'exigent) et demande le micro.
   player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
   player.play().catch(() => {});
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch { $('status').textContent = 'Il faut autoriser le micro.'; return; }
   store('name', me); store('group', group);
+  topic = await topicFor(group);
   $('join').hidden = true; $('room').hidden = false;
   listen();
 };
 
 $('leave').onclick = () => { es && es.close(); store('group'); location.reload(); };
 
+const hello = () => post({ t: 'hi', n: me, id: myId }, null, '&cache=no').catch(() => {});
+
 function listen() {
-  es = new EventSource('/listen?' + qs()); // se reconnecte tout seul si le réseau coupe
-  es.onopen = () => $('status').textContent = 'Connecté au groupe « ' + group + ' »';
+  es = new EventSource(`${RELAY}/${topic}/sse`); // se reconnecte tout seul si le réseau coupe
+  es.onopen = () => { $('status').textContent = 'Connecté au groupe « ' + group + ' »'; hello(); };
   es.onerror = () => $('status').textContent = 'Reconnexion…';
-  es.addEventListener('members', e => {
-    $('friends').innerHTML = '';
-    for (const n of JSON.parse(e.data)) {
-      const s = document.createElement('span');
-      s.textContent = n === me ? n + ' (toi)' : n;
-      s.dataset.name = n;
-      $('friends').append(s);
+  es.onmessage = e => {
+    let m, p;
+    try { m = JSON.parse(e.data); p = JSON.parse(m.message); } catch { return; }
+    if (m.event !== 'message' || !p || p.id === myId || typeof p.n !== 'string') return;
+    const isNew = !seen[p.n] || Date.now() - seen[p.n] > 150000;
+    seen[p.n] = Date.now();
+    renderFriends();
+    if (p.t === 'hi' && isNew) hello(); // un nouveau arrive : on lui dit qu'on est là
+    if (p.t === 'voice' && m.attachment && m.attachment.url) {
+      queue.push({ from: p.n, audio: m.attachment.url });
+      if (player.paused) playNext();
     }
-  });
-  es.addEventListener('voice', e => { queue.push(JSON.parse(e.data)); if (player.paused) playNext(); });
+  };
+  setInterval(hello, 60000);    // "je suis là", toutes les minutes
+  setInterval(renderFriends, 15000);
+  renderFriends();
+}
+
+function renderFriends() {
+  $('friends').innerHTML = '';
+  const names = [me + ' (toi)', ...Object.keys(seen).filter(n => Date.now() - seen[n] < 150000)];
+  for (const n of names) {
+    const s = document.createElement('span');
+    s.textContent = n;
+    s.dataset.name = n;
+    $('friends').append(s);
+  }
 }
 
 function playNext() {
@@ -101,10 +132,12 @@ function start(e) {
   recorder = new MediaRecorder(stream);
   recorder.ondataavailable = d => chunks.push(d.data);
   recorder.onstop = () => {
-    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    const type = recorder.mimeType || 'audio/webm';
+    const blob = new Blob(chunks); // sans type exprès : voir post()
     if (blob.size < 1000) return; // appui trop court
-    fetch('/talk?' + qs(), { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob })
-      .then(r => $('status').textContent = r.ok ? 'Envoyé ✓' : 'Message trop long')
+    const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+    post({ t: 'voice', n: me, id: myId }, blob, '&filename=voix.' + ext)
+      .then(r => $('status').textContent = r.ok ? 'Envoyé ✓' : 'Pas envoyé (' + r.status + ')')
       .catch(() => $('status').textContent = 'Pas envoyé (réseau)');
   };
   recorder.start();
